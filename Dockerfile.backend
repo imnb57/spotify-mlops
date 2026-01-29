@@ -1,0 +1,22 @@
+# Stage 1: Backend
+FROM python:3.9-slim as backend
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ src/
+COPY api/ api/
+COPY data/ data/
+COPY models/ models/
+
+# Expose port for API
+EXPOSE 8000
+
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Stage 2: Frontend
+# In a real microservices architecture, we'd separate these. 
+# For this monorepo/demo, we can build frontend here or use a separate container in compose.
+# We will use docker-compose to run them separately.

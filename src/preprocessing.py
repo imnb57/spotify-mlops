@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.preprocessing import RobustScaler, OneHotEncoder
 import joblib
 import os
 
@@ -13,7 +13,7 @@ class SpotifyPreprocessor:
             'key', 'loudness', 'speechiness', 'acousticness', 
             'instrumentalness', 'liveness', 'valence', 'tempo'
         ]
-        self.scaler = MinMaxScaler()
+        self.scaler = RobustScaler()
         
     def load_data(self):
         """Loads data from CSV."""
@@ -24,8 +24,24 @@ class SpotifyPreprocessor:
     def clean_data(self, df):
         """Removes duplicates and handles missing values."""
         print("Cleaning data...")
-        # Drop duplicates based on track_id
+        # 1. Drop exact ID duplicates
         df = df.drop_duplicates(subset=['track_id'])
+        
+        # 2. Drop "Song Name + Artist" duplicates (Keep first or most popular?)
+        # Let's clean strings first
+        df['name_norm'] = df['track_name'].str.lower().str.strip()
+        df['artist_norm'] = df['artists'].str.lower().str.strip()
+        
+        # Sort by popularity so we keep the most popular version
+        if 'popularity' in df.columns:
+            df = df.sort_values(by='popularity', ascending=False)
+            
+        initial_len = len(df)
+        df = df.drop_duplicates(subset=['name_norm', 'artist_norm'])
+        print(f"Removed {initial_len - len(df)} semantic duplicates.")
+        
+        # Drop temporary columns
+        df = df.drop(columns=['name_norm', 'artist_norm'])
         
         # Drop rows with missing values in critical columns
         df = df.dropna(subset=self.feature_columns)
@@ -46,7 +62,7 @@ class SpotifyPreprocessor:
         df = self.load_data()
         df = self.clean_data(df)
         
-        print("Scaling features...")
+        print("Scaling features using RobustScaler...")
         # Scale numerical features
         df[self.feature_columns] = self.scaler.fit_transform(df[self.feature_columns])
         

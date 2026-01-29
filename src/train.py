@@ -21,11 +21,30 @@ class SpotifyRecommender:
         return df
 
     def train(self):
+        self.train_memory()
+
+    def train_memory(self):
+        """Trains and returns the model object without necessarily saving (though we do save)."""
         df = self.load_data()
         
-        # Ensure only numeric columns are used for training
-        # We assume they are already scaled from preprocessing
-        # Filter for existing columns
+        # --- Feedback Integration ---
+        feedback_path = "data/feedback_data.csv"
+        if os.path.exists(feedback_path):
+            print("Incorporating user feedback...")
+            try:
+                feedback_df = pd.read_csv(feedback_path, names=['track_id', 'liked'])
+                liked_tracks = feedback_df[feedback_df['liked'] == True]['track_id'].unique()
+                
+                if len(liked_tracks) > 0:
+                    print(f"Boosting popularity for {len(liked_tracks)} liked tracks...")
+                    if 'track_id' in df.columns and 'popularity' in df.columns:
+                         mask = df['track_id'].isin(liked_tracks)
+                         df.loc[mask, 'popularity'] = df.loc[mask, 'popularity'] + 0.2
+                         df.loc[df['popularity'] > 1.0, 'popularity'] = 1.0
+            except Exception as e:
+                print(f"Error loading feedback: {e}")
+        # ----------------------------
+
         train_cols = [c for c in self.feature_columns if c in df.columns]
         
         print(f"Training model with features: {train_cols}")
@@ -34,6 +53,7 @@ class SpotifyRecommender:
         print("Fitting NearestNeighbours model...")
         self.model.fit(X)
         
+        # Save artifacts (still good for persistence)
         if not os.path.exists(self.model_dir):
             os.makedirs(self.model_dir)
             
@@ -41,11 +61,12 @@ class SpotifyRecommender:
         joblib.dump(self.model, model_path)
         print(f"Model saved to {model_path}")
         
-        # Save feature columns used
         joblib.dump(train_cols, os.path.join(self.model_dir, 'feature_columns.joblib'))
         
-        # Save track_ids reference if needed, but the API will just load the main dataset
-        # to map index to metadata. We assume the index corresponds to the processed dataframe.
+        with open(os.path.join(self.model_dir, 'version.txt'), 'w') as f:
+            f.write("v1.1.0")
+            
+        return self.model, train_cols
 
 if __name__ == "__main__":
     data_path = os.path.join("data", "processed", "processed_data.csv")

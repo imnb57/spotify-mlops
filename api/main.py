@@ -1,14 +1,13 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import pandas as pd
-import joblib
 import os
 from typing import List, Optional
-from pydantic import BaseModel
+from src.model_manager import ModelManager
 
 app = FastAPI(title="Spotify Recommender API")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,128 +16,152 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables to store model and data
-model = None
-data = None
-feature_columns = None
-scaler = None
+# --- Model Manager ---
+manager = ModelManager()
 
 class Song(BaseModel):
     track_id: str
     track_name: str
     artists: str
     album_name: str
-    popularity: int
-    duration_ms: int
-    explicit: bool
-    album_cover: Optional[str] = None # Placeholder if we had it
-
-@app.on_event("startup")
-def load_artifacts():
-    global model, data, feature_columns, scaler
-    try:
-        print("Loading artifacts...")
-        # Load data (use raw or processed? Raw has metadata, processed has features)
-        # We need raw for display info, and processed features for inference if new data comes in.
-        # But for this simple recommender, we might just need the dataframe and the lookups.
-        
-        # Let's load the raw data for metadata
-        raw_data_path = "data/raw/spotifyDataset.csv"
-        if os.path.exists(raw_data_path):
-            data = pd.read_csv(raw_data_path)
-            # Drop duplicates to match training
-            data = data.drop_duplicates(subset=['track_id']).reset_index(drop=True)
-            print(f"Loaded data with {len(data)} records")
-        
-        # Load model
-        model_path = "models/recommender_model.joblib"
-        if os.path.exists(model_path):
-            model = joblib.load(model_path)
-            print("Model loaded")
-        
-        # Load feature cols
-        features_path = "models/feature_columns.joblib"
-        if os.path.exists(features_path):
-            feature_columns = joblib.load(features_path)
-            
-        processed_data_path = "data/processed/processed_data.csv"
-        if os.path.exists(processed_data_path):
-            processed_data = pd.read_csv(processed_data_path)
-            # Create a matrix for lookup
-            global features_matrix
-            if feature_columns:
-                existing_cols = [c for c in feature_columns if c in processed_data.columns]
-                features_matrix = processed_data[existing_cols].values
-                print("Features matrix loaded")
-                
-    except Exception as e:
-        print(f"Error loading artifacts: {e}")
+    album_cover: Optional[str] = None
+    url: Optional[str] = None
+    reason: Optional[str] = None # New field for explainability
 
 @app.get("/")
-def root():
-    return {"message": "Spotify Recommender API is running"}
+def home():
+    return {"message": "Spotify Recommender API is running (V4.0 Search & Discovery)"}
 
 @app.get("/search", response_model=List[Song])
-def search_songs(q: str = Query(..., min_length=1), limit: int = 10):
+def search(q: str, limit: int = 5):
+    _, _, data = manager.get_active_model()
     if data is None:
         raise HTTPException(status_code=503, detail="Data not loaded")
     
-    # Simple substring search
-    results = data[
-        data['track_name'].str.contains(q, case=False, na=False) | 
-        data['artists'].str.contains(q, case=False, na=False)
-    ].head(limit)
+    results = data[data['track_name'].str.contains(q, case=False, na=False) | 
+                   data['artists'].str.contains(q, case=False, na=False)]
+    results = results.head(limit)
     
     songs = []
     for _, row in results.iterrows():
-        songs.append(Song(
-            track_id=row['track_id'],
-            track_name=row['track_name'],
-            artists=row['artists'],
-            album_name=row['album_name'],
-            popularity=row['popularity'],
-            duration_ms=row['duration_ms'],
-            explicit=bool(row['explicit'])
-        ))
+        try:
+            songs.append(Song(
+                track_id=row['track_id'],
+                track_name=row['track_name'],
+                artists=row['artists'],
+                album_name=row['album_name'],
+                album_cover=row.get('album_cover', None)
+            ))
+        except Exception as e:
+            continue
+            
+    return songs
+
+class Feedback(BaseModel):
+    track_id: str
+    liked: bool
+
+@app.post("/feedback")
+def submit_feedback(feedback: Feedback):
+    print(f"Received feedback: {feedback}")
+    
+    # Save Feedback Only - No Retraining Here
+    feedback_file = "data/feedback_data.csv"
+    new_data = pd.DataFrame([feedback.dict()])
+    
+    if os.path.exists(feedback_file):
+        new_data.to_csv(feedback_file, mode='a', header=False, index=False)
+    else:
+        new_data.to_csv(feedback_file, index=False)
+        
+    return {"status": "success", "message": "Feedback recorded."}
+
+@app.post("/control/retrain")
+def retrain_model():
+    """Manually triggers retraining."""
+    if manager.is_training:
+        return {"status": "busy", "message": "Training already in progress."}
+    
+    success = manager.trigger_retraining()
+    if success:
+        return {"status": "success", "message": "Training started."}
+    else:
+         raise HTTPException(status_code=500, detail="Failed to start training.")
+
+@app.post("/reset")
+def reset_profile():
+    success = manager.reset_baseline()
+    if success:
+        return {"status": "success", "message": "Profile reset to baseline."}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to reset profile.")
+
+@app.get("/model-info")
+def get_model_info():
+    model, features, data = manager.get_active_model()
+    return {
+        "version": manager.model_version,
+        "features": features,
+        "is_training": manager.is_training,
+        "data_size": len(data) if data is not None else 0
+    }
+
+@app.get("/recommend/home", response_model=List[Song])
+def recommend_home(
+    limit: int = 10, 
+    target_energy: Optional[float] = None,
+    target_danceability: Optional[float] = None,
+    target_valence: Optional[float] = None,
+    target_acousticness: Optional[float] = None
+):
+    """Smart Home Feed with optional feature tuning."""
+    
+    overrides = {}
+    if target_energy is not None: overrides['energy'] = target_energy
+    if target_danceability is not None: overrides['danceability'] = target_danceability
+    if target_valence is not None: overrides['valence'] = target_valence
+    if target_acousticness is not None: overrides['acousticness'] = target_acousticness
+    
+    recs = manager.recommend_home(limit=limit, feature_overrides=overrides)
+    
+    songs = []
+    for item in recs:
+        try:
+            songs.append(Song(
+                track_id=item['track_id'],
+                track_name=item['track_name'],
+                artists=item['artists'],
+                album_name=item['album_name'],
+                album_cover=item.get('album_cover', None),
+                reason=item.get('reason', None)
+            ))
+        except Exception:
+            continue
+    return songs
+
+@app.get("/recommend/radio/{track_id}", response_model=List[Song])
+def recommend_radio(track_id: str, limit: int = 10):
+    """Item-to-Item recommendation (Radio)."""
+    recs = manager.recommend_radio(seed_track_id=track_id, limit=limit)
+    
+    songs = []
+    for item in recs:
+        try:
+            songs.append(Song(
+                track_id=item['track_id'],
+                track_name=item['track_name'],
+                artists=item['artists'],
+                album_name=item['album_name'],
+                album_cover=item.get('album_cover', None),
+                reason=item.get('reason', "Similar Vibe")
+            ))
+        except Exception:
+            continue
     return songs
 
 @app.get("/recommend/{track_id}", response_model=List[Song])
 def recommend(track_id: str, limit: int = 5):
-    if model is None or data is None or 'features_matrix' not in globals():
-        raise HTTPException(status_code=503, detail="System not ready")
-        
-    # Find index of track
-    idx_list = data.index[data['track_id'] == track_id].tolist()
-    if not idx_list:
-        raise HTTPException(status_code=404, detail="Track not found")
-    
-    idx = idx_list[0]
-    
-    # Get features
-    # features = features_matrix[idx].reshape(1, -1)
-    
-    # Find neighbors
-    # distances, indices = model.kneighbors(features, n_neighbors=limit+1)
-    
-    # Optimize: Pre-computed model allows finding neighbors
-    distances, indices = model.kneighbors(features_matrix[idx].reshape(1, -1), n_neighbors=limit+1)
-    
-    recommended_songs = []
-    for i in range(1, len(indices[0])): # Skip self
-        neighbor_idx = indices[0][i]
-        row = data.iloc[neighbor_idx]
-        recommended_songs.append(Song(
-            track_id=row['track_id'],
-            track_name=row['track_name'],
-            artists=row['artists'],
-            album_name=row['album_name'],
-            popularity=row['popularity'],
-            duration_ms=row['duration_ms'],
-            explicit=bool(row['explicit'])
-        ))
-        
-    return recommended_songs
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
+    # Standard item-to-item (legacy endpoint, maybe keep for PDP)
+    # Re-using the logic from manager for consistency could be better, 
+    # but sticking to original impl for now to avoid breaking changes if any.
+    return recommend_radio(track_id, limit)

@@ -1,0 +1,43 @@
+name: Retrain Model
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight
+  workflow_dispatch:
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install dvc[s3] # Example storage
+          
+      - name: Fetch Data
+        env:
+            SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+            SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+        run: python src/ingestion.py --limit 100
+        
+      - name: Preprocess & Train
+        run: |
+          python src/preprocessing.py
+          python src/train.py
+          
+      - name: Commit DVC & Push
+        run: |
+          dvc commit
+          dvc push
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          git add dvc.lock data/raw/spotifyDataset.csv.dvc
+          git commit -m "Automated model retraining"
+          git push
